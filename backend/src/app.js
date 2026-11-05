@@ -28,6 +28,7 @@ import { analyticsRouter } from './modules/analytics/analytics.routes.js';
 import { aiRouter } from './modules/ai/ai.routes.js';
 
 export const app = express();
+app.set('trust proxy', 1);
 
 /**
  * Configure global security headers and CORS.
