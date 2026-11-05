@@ -25,6 +25,7 @@ import { paymentRouter } from './modules/payments/payment.routes.js';
 import { fulfillmentRouter } from './modules/fulfillment/fulfillment.routes.js';
 import { transferRouter } from './modules/transfers/transfer.routes.js';
 import { analyticsRouter } from './modules/analytics/analytics.routes.js';
+import { aiRouter } from './modules/ai/ai.routes.js';
 
 export const app = express();
 
@@ -117,6 +118,7 @@ apiRouter.use('/payments', paymentRouter);
 apiRouter.use('/fulfillment', fulfillmentRouter);
 apiRouter.use('/transfers', transferRouter);
 apiRouter.use('/analytics', analyticsRouter);
+apiRouter.use('/ai', aiRouter);
 app.use('/api/v1', apiRouter);
 
 // 4. Catch-all for undefined routes
