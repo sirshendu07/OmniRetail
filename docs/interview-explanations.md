@@ -219,3 +219,65 @@ Requires an active Redis instance.
 
 ### 7. How to Test
 Unit tests in `tests/unit/crypto.test.js` and integration tests in `tests/integration/auth.test.js` Subtest 3 validating verification and attempt decrementing.
+
+---
+
+## Decision 8: Server-Side Authoritative Pricing vs Client-Supplied Prices
+
+### 1. Problem
+Untrusted client applications (browsers, mobile apps) can easily be manipulated using developer tools, proxy interceptors (Burp Suite), or modified HTTP payloads to alter product prices (e.g. changing \$999 to \$1 before submitting an order).
+
+### 2. Naive Solution
+Accept `price` or `total` fields from the client request payload and record them into the order document.
+
+### 3. Limitation of Naive Solution
+Catastrophic financial loss: users can purchase luxury goods for pennies. Client input can never be trusted for financial computations.
+
+### 4. Chosen Solution
+**Authoritative Server-Side Pricing Engine:**
+The client only submits `{ productId, quantity, couponCode }`.
+The server:
+1. Fetches current product documents from MongoDB.
+2. Resolves effective unit prices (`salePrice ?? regularPrice`).
+3. Computes line totals (`unitPrice * quantity`).
+4. Validates coupon rules (validity dates, min order amounts, max discount caps).
+5. Computes authoritative subtotal, discount, and grand total.
+
+### 5. Why Chosen Solution is Better
+Complete mathematical and financial integrity. Client tampering has zero impact on final billing.
+
+### 6. Trade-offs
+Requires fetching products during cart calculation and order placement.
+
+### 7. How to Test
+Unit tests in `tests/unit/pricing.test.js` asserting server-side computation, discount caps, and rejection of invalid coupons.
+
+---
+
+## Decision 9: Redis Cache-Aside Pattern with Automated Cache Invalidation for Product Catalogs
+
+### 1. Problem
+Product detail endpoints (`/products/:id`) receive heavy traffic (e.g. 90%+ of total requests during high-traffic sales). Directly hitting MongoDB on every product view creates database query pool contention and increases p99 latency.
+
+### 2. Naive Solution
+Query MongoDB directly on every request or use in-memory Node.js caches (e.g. `Map`).
+
+### 3. Limitation of Naive Solution
+- MongoDB query pool exhaustion under peak load.
+- In-memory Node caches are local to each process: updating a product on one container leaves stale data in other containers.
+
+### 4. Chosen Solution
+**Distributed Redis Cache-Aside Strategy (`product:<id>`):**
+1. On read: check Redis cache first. If found, parse and return immediately ($< 2\text{ms}$).
+2. On miss: fetch from MongoDB, populate Redis with a 1-hour TTL, and return.
+3. On write (create, update, delete): immediately invalidate `product:<id>` and catalog pattern caches (`products:*`).
+4. **Resilience:** If Redis fails or has a network partition, the service logs a warning and falls back to MongoDB transparently without crashing.
+
+### 5. Why Chosen Solution is Better
+Sub-millisecond read latency, high throughput, zero stale data upon product edits, and complete failure tolerance.
+
+### 6. Trade-offs
+Adds Redis operational dependency.
+
+### 7. How to Test
+Integration test in `tests/integration/catalog.test.js` Subtests 5 and 6 asserting cache population and cache invalidation upon product update.

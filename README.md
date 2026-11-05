@@ -208,7 +208,7 @@ npm run dev
 
 - [x] **Milestone 1 — Backend Foundation** (Express, Zod env validation, MongoDB Atlas, Redis, Kafka client, structured logging, health probes, centralized errors)
 - [x] **Milestone 2 — Advanced Authentication** (Argon2id, dual-token JWT, refresh token rotation with reuse detection, HttpOnly cookies, CSRF, Redis OTP, RBAC)
-- [ ] **Milestone 3 — Product Catalogue & Pricing**
+- [x] **Milestone 3 — Product Catalogue & Pricing** (Hierarchical categories, SKU uniqueness, weighted text search, Cloudinary uploads, Redis cache-aside, server-side pricing engine)
 - [ ] **Milestone 4 — Concurrency-Safe Inventory Engine**
 - [ ] **Milestone 5 — Cart & Order Management (Outbox Pattern)**
 - [ ] **Milestone 6 — Razorpay Payment Gateway & Webhook Signature Verification**

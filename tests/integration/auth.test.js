@@ -154,9 +154,10 @@ describe('Auth & Session Management Integration Tests', () => {
     assert.equal(res.status, 401);
     assert.equal(body.code, 'TOKEN_REUSE_DETECTED');
 
-    // Verify all sessions were revoked in DB
-    const activeSessions = await Session.find({ isRevoked: false });
-    assert.equal(activeSessions.length, 0, 'All user sessions must be revoked upon token reuse detection');
+    // Verify all sessions for this specific user were revoked in DB
+    const testUser = await User.findOne({ email: testEmail });
+    const activeSessions = await Session.find({ userId: testUser._id, isRevoked: false });
+    assert.equal(activeSessions.length, 0, 'All user sessions for this user must be revoked upon token reuse detection');
   });
 
   it('8. POST /api/v1/auth/logout rejects state-changing cookie request without CSRF header', async () => {
