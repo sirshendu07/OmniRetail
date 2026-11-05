@@ -12,6 +12,8 @@ import { isRedisHealthy } from './infrastructure/redis/redis.client.js';
 import { isKafkaProducerHealthy } from './infrastructure/kafka/producer.js';
 import { sendSuccess } from './common/utils/responseHandler.js';
 import { asyncHandler } from './common/utils/asyncHandler.js';
+import { authRouter } from './modules/auth/auth.routes.js';
+import { userRouter } from './modules/users/user.routes.js';
 
 export const app = express();
 
@@ -91,6 +93,8 @@ const apiRouter = express.Router();
 apiRouter.get('/', (_req, res) => {
   return sendSuccess(res, 'OmniRetail API v1 operational', { version: '1.0.0' });
 });
+apiRouter.use('/auth', authRouter);
+apiRouter.use('/users', userRouter);
 app.use('/api/v1', apiRouter);
 
 // 4. Catch-all for undefined routes

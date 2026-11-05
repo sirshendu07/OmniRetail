@@ -96,7 +96,126 @@ express.json({
 Allows the Razorpay webhook verification service to calculate HMAC against the authentic raw buffer without needing a separate pre-body-parser route architecture.
 
 ### 6. Trade-offs
-Slightly higher memory overhead per request during parsing, mitigated by strict 10MB payload size limits.
+Slightly higher memory overhead per request during parsing, mitigated by strict 2MB payload size limits.
 
 ### 7. How to Test
 Verify in payment integration tests that HMAC signatures generated from the raw buffer match Razorpay's test signatures.
+
+---
+
+## Decision 4: Argon2id vs Bcrypt for Password Hashing
+
+### 1. Problem
+Retail platforms with millions of user accounts face credential stuffing and offline dictionary attacks if password databases are ever compromised.
+
+### 2. Naive Solution
+Use legacy MD5/SHA256, or traditional Bcrypt with standard work factors ($10\text{--}12$).
+
+### 3. Limitation of Naive Solution
+Bcrypt is CPU-bound but uses negligible memory ($4\text{ KB}$). Modern threat actors utilize massively parallel GPU farms (thousands of cores) and custom ASIC clusters to compute millions of candidate Bcrypt hashes per second.
+
+### 4. Chosen Solution
+**Argon2id** (winner of the Password Hashing Competition) configured with memory-hard parameters:
+- `memoryCost`: $65536\text{ KB}$ ($64\text{ MB}$ RAM required per computation)
+- `timeCost`: $3$ iterations
+- `parallelism`: $4$ threads
+
+### 5. Why Chosen Solution is Better
+Because each password verification requires 64MB of physical memory, parallelizing attacks on GPUs or ASICs is economically infeasible — memory bandwidth becomes the insurmountable bottleneck. Argon2id hybrid mode also protects against side-channel cache attacks.
+
+### 6. Trade-offs
+Slightly higher server RAM and CPU consumption during login. Mitigated by distributed rate limiting on auth endpoints to prevent denial-of-service attempts.
+
+### 7. How to Test
+Unit tests in `tests/unit/crypto.test.js` validating Argon2id hash prefix `$argon2id$`, timing parity, and verification of valid vs invalid passwords.
+
+---
+
+## Decision 5: Hybrid JWT Access Token + Database-Backed Refresh Token Rotation with Token Family Reuse Detection
+
+### 1. Problem
+Stateless JWTs cannot be revoked immediately if a user logs out, changes passwords, or reports a stolen device. Conversely, pure database session lookups on every single API request ($100\text{k}+ \text{req/s}$) overwhelm database read pools.
+
+### 2. Naive Solution
+Issue long-lived stateless JWTs ($30\text{ days}$) stored in localStorage with no server revocation tracking.
+
+### 3. Limitation of Naive Solution
+- If a token is stolen via XSS or network eavesdropping, the attacker retains full access for 30 days.
+- The server has no technical capability to revoke the token upon user logout.
+
+### 4. Chosen Solution
+A **Hybrid Dual-Token Architecture with Token Family Rotation (RFC 6819)**:
+1. Short-lived JWT Access Token ($15\text{ minutes}$) carrying identity claims (`userId`, `role`, `sessionId`).
+2. Long-lived opaque Refresh Token ($7\text{ days}$) stored in MongoDB as a cryptographic SHA-256 hash.
+3. Every time `/auth/refresh` is called, the refresh token is **rotated**: the old token hash is archived into `previousHashedTokens` and a fresh refresh token is issued.
+4. **Token Family Reuse Detection:** If an incoming refresh token matches ANY token in `previousHashedTokens`, the system flags token reuse! An attacker has intercepted or replayed an already-consumed token. The system immediately **revokes the entire session family** (`revokeAllUserSessions`) and locks out the attacker.
+
+### 5. Why Chosen Solution is Better
+- Eliminates database reads on 95%+ of API requests (access tokens verified cryptographically in memory).
+- Revocation capability preserved: active sessions can be revoked on demand.
+- Immediate detection and neutralisation of token theft.
+
+### 6. Trade-offs
+Requires storing session records and managing session cleanup.
+
+### 7. How to Test
+Integration test in `tests/integration/auth.test.js` Subtest 6 (token rotation) and Subtest 7 (replaying rotated token triggers `TOKEN_REUSE_DETECTED` and revokes all sessions).
+
+---
+
+## Decision 6: HttpOnly Cookies + CSRF Defense vs LocalStorage Tokens
+
+### 1. Problem
+Web single-page applications (React/Next.js/Vue) frequently store auth tokens in `localStorage`.
+
+### 2. Naive Solution
+Return tokens in the JSON response body and have JavaScript save them to `localStorage.setItem('accessToken', ...)`.
+
+### 3. Limitation of Naive Solution
+Any Cross-Site Scripting (XSS) vulnerability anywhere in third-party npm libraries or user-generated content allows malicious JavaScript to execute `localStorage.getItem('token')` and silently exfiltrate user credentials to an attacker-controlled server.
+
+### 4. Chosen Solution
+Store both access and refresh tokens exclusively in **HttpOnly, Secure, SameSite=Lax/Strict** cookies. JavaScript running in the browser cannot read or exfiltrate HttpOnly cookies (`document.cookie` returns empty).
+To protect against Cross-Site Request Forgery (CSRF) caused by ambient cookie sending, implement:
+1. Strict CORS whitelist (`env.FRONTEND_URL`).
+2. Custom request header validation (`X-Requested-With` or `X-CSRF-Token`) for all state-changing methods (`POST`, `PUT`, `PATCH`, `DELETE`).
+
+### 5. Why Chosen Solution is Better
+Immune to token theft via XSS. Cross-origin HTML forms cannot forge custom headers because browsers enforce CORS preflight options checks.
+
+### 6. Trade-offs
+Requires careful cookie configuration (path, domain, sameSite) across development and production environments.
+
+### 7. How to Test
+Integration test in `tests/integration/auth.test.js` Subtests 8 and 9 asserting that state-changing requests without the CSRF header are rejected with 403 Forbidden.
+
+---
+
+## Decision 7: Redis-Backed Keyed HMAC OTP with Rate and Cooldown Limiting
+
+### 1. Problem
+SMS and email verification codes (6 digits) have an inherently small keyspace ($10^6 = 1,000,000$ combinations), making them vulnerable to brute-force guessing and SMS/email toll-fraud attacks if not aggressively rate-limited.
+
+### 2. Naive Solution
+Store the 6-digit number in plaintext in MongoDB with a TTL index and check client guesses in a loop.
+
+### 3. Limitation of Naive Solution
+- Plaintext OTPs in databases risk internal employee exfiltration.
+- MongoDB TTL background threads run only every 60 seconds, leaving windows of vulnerability.
+- Without attempt limits, an automated script can guess $1,000,000$ combinations in minutes.
+
+### 4. Chosen Solution
+- Cryptographically secure generation (`crypto.randomInt(100000, 1000000)`).
+- **Keyed HMAC-SHA256:** Plaintext OTP is hashed with `env.OTP_HMAC_SECRET` before being stored in Redis with an exact 300-second TTL.
+- **Timing-Safe Comparison:** `crypto.timingSafeEqual` prevents timing-leak attacks.
+- **Maximum 5 Attempts:** Stored counter tracks failed attempts. If 5 attempts are exceeded, the OTP is deleted immediately.
+- **60-Second Cooldown:** Dedicated Redis cooldown key (`otp:cooldown:...`) prevents spamming resend buttons.
+
+### 5. Why Chosen Solution is Better
+Sub-millisecond validation in Redis memory, zero plaintext credential storage, atomic attempt tracking, and complete protection against brute force and resend abuse.
+
+### 6. Trade-offs
+Requires an active Redis instance.
+
+### 7. How to Test
+Unit tests in `tests/unit/crypto.test.js` and integration tests in `tests/integration/auth.test.js` Subtest 3 validating verification and attempt decrementing.
