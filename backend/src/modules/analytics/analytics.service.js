@@ -1,22 +1,23 @@
 import { Order } from '../orders/order.model.js';
 import { Inventory } from '../inventory/inventory.model.js';
 
+function buildSalesMatchStage(startDate, endDate) {
+  const match = { status: { $in: ['CONFIRMED', 'ALLOCATED', 'SHIPPED', 'DELIVERED'] } };
+  if (startDate || endDate) {
+    match.createdAt = {};
+    if (startDate) match.createdAt.$gte = new Date(startDate);
+    if (endDate) match.createdAt.$lte = new Date(endDate);
+  }
+  return match;
+}
+
 export class AnalyticsService {
   /**
    * Aggregates store-level Gross Merchandise Value (GMV), order counts, and AOV.
    */
   async getStoreSalesMetrics(startDate = null, endDate = null) {
-    const matchStage = {
-      status: { $in: ['CONFIRMED', 'ALLOCATED', 'SHIPPED', 'DELIVERED'] }
-    };
-    if (startDate || endDate) {
-      matchStage.createdAt = {};
-      if (startDate) matchStage.createdAt.$gte = new Date(startDate);
-      if (endDate) matchStage.createdAt.$lte = new Date(endDate);
-    }
-
     return Order.aggregate([
-      { $match: matchStage },
+      { $match: buildSalesMatchStage(startDate, endDate) },
       {
         $group: {
           _id: '$fulfillmentLocationId',
@@ -25,14 +26,7 @@ export class AnalyticsService {
           avgOrderValue: { $avg: '$pricing.grandTotal' }
         }
       },
-      {
-        $lookup: {
-          from: 'locations',
-          localField: '_id',
-          foreignField: '_id',
-          as: 'location'
-        }
-      },
+      { $lookup: { from: 'locations', localField: '_id', foreignField: '_id', as: 'location' } },
       { $unwind: '$location' },
       {
         $project: {

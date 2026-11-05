@@ -12,10 +12,11 @@
     "dev": "node --watch src/server.js",
     "worker": "node src/worker.js",
     "worker:dev": "node --watch src/worker.js",
-    "test": "node --test tests/**/*.test.js",
-    "test:unit": "node --test tests/unit/**/*.test.js",
-    "test:integration": "node --test tests/integration/**/*.test.js",
-    "test:concurrency": "node --test tests/concurrency/**/*.test.js"
+    "test": "node --test --test-concurrency=1 tests/**/*.test.js",
+    "test:unit": "node --test --test-concurrency=1 tests/unit/**/*.test.js",
+    "test:integration": "node --test --test-concurrency=1 tests/integration/**/*.test.js",
+    "test:concurrency": "node --test --test-concurrency=1 tests/concurrency/**/*.test.js",
+    "seed": "node src/database/seed.js"
   },
   "keywords": [
     "retail",

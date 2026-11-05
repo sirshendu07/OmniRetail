@@ -281,3 +281,245 @@ Adds Redis operational dependency.
 
 ### 7. How to Test
 Integration test in `tests/integration/catalog.test.js` Subtests 5 and 6 asserting cache population and cache invalidation upon product update.
+
+---
+
+## Decision 10: Atomic Lock-Free Conditional Updates for Concurrency-Safe Inventory Allocation
+
+### 1. Problem
+During flash sales or high-demand product drops, hundreds of concurrent requests arrive in the exact same millisecond trying to reserve a limited stock (e.g. 10 remaining iPhone units). A race condition could lead to overselling (negative stock), creating customer dissatisfaction and expensive manual order cancellations.
+
+### 2. Naive Solution
+Read stock with `findById`, check if `availableStock >= requestedQuantity` in JavaScript, and if true, execute `save()` with updated counts (or use pessimistic row locking `SELECT ... FOR UPDATE` in SQL).
+
+### 3. Limitation of Naive Solution
+- The read-check-write sequence in JavaScript is not atomic. Multiple concurrent requests read stock = 10 simultaneously, all conclude there is stock, and all decrement, driving stock negative (overselling).
+- Pessimistic locking in SQL/NoSQL serializes transactions at the row level, causing catastrophic thread contention, lock queue timeouts, and deadlock cascades under high throughput.
+
+### 4. Chosen Solution
+**Atomic Conditional Decrements via MongoDB Filter Expressions:**
+```javascript
+const inventory = await Inventory.findOneAndUpdate(
+  {
+    productId,
+    locationId,
+    availableStock: { $gte: quantity } // Atomic lock-free condition
+  },
+  {
+    $inc: {
+      availableStock: -quantity,
+      reservedStock: +quantity
+    }
+  },
+  { new: true, session }
+);
+```
+If `availableStock` is less than `quantity`, MongoDB atomically modifies 0 documents and returns `null`. The operation succeeds or fails purely within the database engine's atomic document lock without any distributed locks or application-level locks.
+
+### 5. Why Chosen Solution is Better
+- Guaranteed zero overselling: mathematically impossible for stock to drop below 0.
+- Lock-free high throughput: operations on different products and locations execute in complete parallel without blocking.
+- Every reservation writes to an append-only `InventoryLedger` with a running snapshot balance.
+
+### 6. Trade-offs
+Requests that fail the condition immediately get an `INSUFFICIENT_STOCK` error; they do not queue up waiting for replenishment unless a retry queue is explicitly constructed.
+
+### 7. How to Test
+Execute `tests/concurrency/inventory.test.js` where 10 concurrent requests simultaneously race to reserve the last single unit. Exactly 1 request succeeds (201 Created), 9 requests fail (409 Conflict), and final available stock is exactly 0.
+
+---
+
+## Decision 11: Transactional Outbox Pattern to Solve the Dual-Write Problem
+
+### 1. Problem
+When a customer completes checkout, the system must save the order in MongoDB and publish an `OrderCreated` event to Apache Kafka. If the database write succeeds but the Kafka publish crashes (network timeout, broker restart), downstream services (payment, fulfillment, notifications) never know the order exists. If the Kafka publish happens first and the database transaction aborts, phantom events trigger processing for non-existent orders. This is the classic **Dual-Write Problem**.
+
+### 2. Naive Solution
+Execute `order.save()` and immediately call `kafkaProducer.send()` in the same HTTP request handler.
+
+### 3. Limitation of Naive Solution
+Dual-writes across two different distributed systems (MongoDB and Kafka) cannot participate in a single two-phase commit without severe performance bottlenecks and single-point-of-failure vulnerabilities. Network partitions inevitably cause data drift and silent lost updates.
+
+### 4. Chosen Solution
+**Transactional Outbox Pattern:**
+1. In the same MongoDB replica set transaction (`session.withTransaction`), insert both the `Order` document, `Reservation` records, and an `Outbox` event envelope:
+```javascript
+await session.withTransaction(async () => {
+  await orderRepo.create([orderData], { session });
+  await reservationRepo.create([resData], { session });
+  await outboxRepo.create([envelope], { session }); // 100% atomic
+});
+```
+2. An asynchronous background Outbox Publisher Worker (`src/workers/outbox.worker.js`) polls `Outbox` events with status `PENDING`, publishes them reliably to Apache Kafka, and marks them `PUBLISHED` upon broker ACK.
+
+### 5. Why Chosen Solution is Better
+- Zero dual-write inconsistency: database write and event persistence succeed or abort together as a single atomic unit.
+- Non-blocking: API response to the user does not wait for Kafka network latency or partition rebalances.
+- Guaranteed at-least-once message delivery to Kafka.
+
+### 6. Trade-offs
+Introduces asynchronous eventual consistency (sub-second lag between order creation and Kafka delivery) and requires downstream consumers to be idempotent.
+
+### 7. How to Test
+Verify in `tests/integration/orders.test.js` and `tests/integration/kafka.test.js` that order checkout records outbox documents within the active session, and publisher worker dispatches to Kafka partitions.
+
+---
+
+## Decision 12: Idempotent Consumers with Inbox Deduplication Pattern
+
+### 1. Problem
+Because Kafka and message networks guarantee **At-Least-Once Delivery**, network retries, consumer rebalances, or producer retries can cause duplicate messages to be delivered to workers. If an `OrderPaid` or `InventoryReserved` event is processed twice, money could be charged twice or double inventory deducted.
+
+### 2. Naive Solution
+Rely on Kafka consumer offsets alone and assume each message is received exactly once.
+
+### 3. Limitation of Naive Solution
+When a consumer process crashes after executing business logic but before committing offsets back to Kafka, the rebalanced consumer will re-read and re-execute the same message, causing duplicate business actions (duplicate payments, inventory leakage).
+
+### 4. Chosen Solution
+**Inbox Deduplication Pattern:**
+Every event carries a unique, deterministic `eventId` in its standard envelope (`src/infrastructure/kafka/eventEnvelope.js`). Before processing any incoming message, the consumer checks the `inbox` collection:
+```javascript
+// Unique compound index on { messageId: 1, consumerGroup: 1 }
+const isAlreadyHandled = await inboxService.isProcessed(messageId, consumerGroup);
+if (isAlreadyHandled) {
+  logger.info({ messageId }, 'Duplicate message detected. Skipping.');
+  return;
+}
+```
+Upon successful business execution, the consumer atomically records `{ messageId, consumerGroup, processedAt }` in the Inbox with a 7-day TTL index.
+
+### 5. Why Chosen Solution is Better
+- Complete idempotency: duplicate deliveries are safely ignored with zero side-effects.
+- Self-cleaning: TTL index automatically prunes old inbox records to keep database footprint lean.
+
+### 6. Trade-offs
+One additional fast indexed lookup per incoming event before domain processing.
+
+### 7. How to Test
+Tested in `tests/integration/saga.test.js` where duplicate events are supplied with the same `eventId`; the system processes the first and idempotently skips the duplicate.
+
+---
+
+## Decision 13: Distributed Order Saga Orchestrator with Compensating Transactions
+
+### 1. Problem
+In an omnichannel retail system, an order spans multiple distinct lifecycle stages: Stock Reservation -> Payment Capture -> Order Allocation -> Fulfillment Routing. If a payment fails or gateway times out, the stock reserved at checkout must be immediately released so other customers can buy it. Distributed 2-Phase Commit (2PC) blocks all participants and degrades availability.
+
+### 2. Naive Solution
+Synchronous blocking calls between Order, Payment, and Inventory services; if any HTTP call fails, attempt immediate reverse HTTP calls.
+
+### 3. Limitation of Naive Solution
+If the server crashes mid-flight or the network drops during the compensation call, reserved stock is permanently leaked. Synchronous HTTP coupling makes the entire checkout chain as fragile as its weakest link.
+
+### 4. Chosen Solution
+**Orchestrated Saga Pattern with Asynchronous Compensations:**
+- Orchestrator: `src/modules/sagas/orderSaga.orchestrator.js` listening to Kafka topics (`payment-events`).
+- **Happy Path:** When `PaymentCaptured` event is received, verify Inbox, transition Order status from `CONFIRMED` to `ALLOCATED`, and publish `OrderAllocated`.
+- **Compensation Path:** When `PaymentFailed` event is received, execute compensating transaction:
+  1. Atomically release reserved stock at the designated location (`availableStock: +qty, reservedStock: -qty`).
+  2. Mark the `Reservation` record as `CANCELLED`.
+  3. Transition Order status to `PAYMENT_FAILED`.
+  4. Write audit ledger entry explaining the cancellation reason.
+
+### 5. Why Chosen Solution is Better
+- High system availability: each step executes independently without holding database locks across services.
+- Resilient recovery: compensating transactions run reliably from the event bus even if payment capture failed minutes after order placement.
+
+### 6. Trade-offs
+Requires handling intermediate states (`CONFIRMED`, `ALLOCATED`, `PAYMENT_FAILED`) in the UI and business reporting.
+
+### 7. How to Test
+Executed in `tests/integration/saga.test.js`: Subtest 2 verifies positive transition to `ALLOCATED`; Subtest 3 verifies automated compensation releasing stock and marking order `PAYMENT_FAILED` on `PaymentFailed`.
+
+---
+
+## Decision 14: Omnichannel Proximity Routing & BOPIS (Store vs Warehouse)
+
+### 1. Problem
+A national retail customer orders items online. Fulfilling every order from a central warehouse introduces high courier costs and multi-day delivery times. Conversely, blindly fulfilling from local stores risks depleting local shelf inventory or routing to stores with zero stock.
+
+### 2. Naive Solution
+Fulfill all online orders from a single central warehouse, or pick a random store in the customer's state.
+
+### 3. Limitation of Naive Solution
+Sub-optimal unit economics: high shipping freight, slow delivery times, and rampant store stockouts.
+
+### 4. Chosen Solution
+**Intelligent Proximity Fulfillment Routing Engine:**
+1. Indexed with MongoDB GeoJSON `2dsphere` spatial indexes.
+2. Query locations sorted by spherical distance from customer coordinates (`$near`).
+3. For each nearby location, verify real-time available stock for all line items.
+4. If a local store within 30km has all items in stock, route as `SHIP_FROM_STORE` (same-day / low-cost).
+5. If local stores lack sufficient stock, fallback to the nearest `REGIONAL_WAREHOUSE` or `DISTRIBUTION_CENTER`.
+6. For Click & Collect / BOPIS orders: verify dedicated store shelf stock and reserve instantly for customer in-store pickup.
+
+### 5. Why Chosen Solution is Better
+Minimizes last-mile fulfillment cost, maximizes inventory turns, and provides instant BOPIS eligibility confirmation for local shoppers.
+
+### 6. Trade-offs
+Requires keeping location geospatial coordinates updated and querying inventory across candidate locations.
+
+### 7. How to Test
+Tested in `tests/integration/fulfillment_analytics.test.js` Subtests 1, 2, and 3 verifying proximity resolution, BOPIS verification, and inter-store stock transfers.
+
+---
+
+## Decision 15: Real-Time Operational Analytics via MongoDB Aggregation Pipelines
+
+### 1. Problem
+Retail operations directors need live visibility into store-level Gross Merchandise Value (GMV), network stockouts, and omnichannel channel splits (BOPIS vs Delivery) without overloading operational OLTP transaction tables.
+
+### 2. Naive Solution
+Run JavaScript loops in memory: load all orders into Node.js arrays and compute `.reduce()` or `.filter()`.
+
+### 3. Limitation of Naive Solution
+Node.js processes run out of memory when querying thousands of orders, block the single-threaded event loop for seconds, and cripple API responsiveness.
+
+### 4. Chosen Solution
+**Targeted Multi-Stage MongoDB Aggregation Pipelines (`src/modules/analytics/analytics.service.js`):**
+- Utilizes `$match` with selective compound index filters (date ranges, confirmed order statuses).
+- Uses `$group` and accumulator operators (`$sum`, `$avg`) executed natively in the C++ MongoDB query engine.
+- `$lookup` joins store metadata efficiently on indexed foreign keys.
+- Computed metrics: Store GMV, Average Order Value (AOV), total network inventory health, and revenue channel split.
+
+### 5. Why Chosen Solution is Better
+Sub-100ms execution on server, minimal network serialization payload, zero memory strain on Node.js application containers.
+
+### 6. Trade-offs
+High aggregation complexity requires careful compound indexing on `{ status: 1, createdAt: 1, fulfillmentLocationId: 1 }`.
+
+### 7. How to Test
+Tested in `tests/integration/fulfillment_analytics.test.js` Subtests 4, 5, and 6 asserting GMV calculations, inventory health counters, and BOPIS revenue splits.
+
+---
+
+## Decision 16: Autonomous AI Shopping Assistant with Gemini Function Calling & Qdrant RAG
+
+### 1. Problem
+Traditional keyword product search fails when customers ask complex natural language questions (e.g. "Do you have any noise-canceling headphones in stock near Dallas, and can I pick them up today?"). Pure LLM chatbots hallucinate prices and do not have access to live inventory databases.
+
+### 2. Naive Solution
+Dump database tables into the LLM system prompt on every user query.
+
+### 3. Limitation of Naive Solution
+Exceeds context token windows, incurs massive API latency and cost, and still suffers from hallucination because the LLM is not grounded in real-time inventory balances.
+
+### 4. Chosen Solution
+**Gemini AI Service with Native Function Calling & Qdrant Vector Search:**
+1. **Semantic Search via Qdrant Cloud:** Product embeddings (768-dim) are stored in Qdrant with cosine similarity search to retrieve semantically matching items even with typos or descriptive queries.
+2. **Gemini Native Function Calling (`retailTools.js`):**
+   - `check_product_stock`: Real-time inventory query across store locations.
+   - `find_nearest_store`: Geospatial search for stores within a given radius.
+   - `track_order`: Live order status and tracking query.
+3. If the user asks a transactional or stock question, Gemini autonomously executes the tool call against the backend service, inspects the verified database JSON response, and generates an accurate, hallucination-free answer.
+
+### 5. Why Chosen Solution is Better
+Combines the natural conversational intelligence of Generative AI with the strict mathematical accuracy of live backend database queries. Zero hallucinated inventory or fake order statuses.
+
+### 6. Trade-offs
+Requires external API keys (Gemini, Qdrant) and handling network latency from external AI providers.
+
+### 7. How to Test
+Unit and integration tests verifying tool schemas, mock responses, and fallback error handling when AI credentials are not configured.
+
