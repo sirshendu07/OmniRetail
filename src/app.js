@@ -21,6 +21,7 @@ import { locationRouter } from './modules/locations/location.routes.js';
 import { inventoryRouter } from './modules/inventory/inventory.routes.js';
 import { cartRouter } from './modules/cart/cart.routes.js';
 import { orderRouter } from './modules/orders/order.routes.js';
+import { paymentRouter } from './modules/payments/payment.routes.js';
 
 export const app = express();
 
@@ -109,6 +110,7 @@ apiRouter.use('/locations', locationRouter);
 apiRouter.use('/inventory', inventoryRouter);
 apiRouter.use('/cart', cartRouter);
 apiRouter.use('/orders', orderRouter);
+apiRouter.use('/payments', paymentRouter);
 app.use('/api/v1', apiRouter);
 
 // 4. Catch-all for undefined routes
