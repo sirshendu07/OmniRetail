@@ -63,3 +63,18 @@ export async function calculateOrderPricing({ items = [], couponCode = null }) {
   const total = Number(Math.max(0, subtotal - discount).toFixed(2));
   return { subtotal, discount, total, appliedCoupon, lineItems };
 }
+
+export const pricingService = {
+  resolveEffectivePrice: getEffectivePrice,
+  getEffectivePrice,
+  validateCouponRules,
+  computeDiscountAmount,
+  calculateCouponDiscount: computeDiscountAmount,
+  calculateOrderPricing,
+  async validateCoupon(code, subtotal) {
+    const coupon = await couponRepo.findCouponByCode(code);
+    if (!coupon) throw AppError.notFound(`Coupon code "${code}" not found`);
+    validateCouponRules(coupon, subtotal);
+    return coupon;
+  }
+};

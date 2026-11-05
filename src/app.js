@@ -19,6 +19,8 @@ import { categoryRouter } from './modules/categories/category.routes.js';
 import { pricingRouter } from './modules/pricing/pricing.routes.js';
 import { locationRouter } from './modules/locations/location.routes.js';
 import { inventoryRouter } from './modules/inventory/inventory.routes.js';
+import { cartRouter } from './modules/cart/cart.routes.js';
+import { orderRouter } from './modules/orders/order.routes.js';
 
 export const app = express();
 
@@ -105,6 +107,8 @@ apiRouter.use('/categories', categoryRouter);
 apiRouter.use('/pricing', pricingRouter);
 apiRouter.use('/locations', locationRouter);
 apiRouter.use('/inventory', inventoryRouter);
+apiRouter.use('/cart', cartRouter);
+apiRouter.use('/orders', orderRouter);
 app.use('/api/v1', apiRouter);
 
 // 4. Catch-all for undefined routes

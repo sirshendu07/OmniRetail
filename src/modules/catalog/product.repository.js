@@ -43,3 +43,13 @@ export async function updateProductById(id, updates) {
 export async function deleteProductById(id) {
   return Product.findByIdAndDelete(id).exec();
 }
+
+export const productRepository = {
+  findById: findProductById,
+  create: createProduct,
+  findBySku: findProductBySku,
+  find: findProducts,
+  search: searchProducts,
+  updateById: updateProductById,
+  deleteById: deleteProductById
+};
