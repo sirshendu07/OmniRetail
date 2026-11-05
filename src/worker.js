@@ -1,15 +1,22 @@
 import { logger } from './common/utils/logger.js';
 import { connectDatabase } from './database/connection.js';
+import { connectRedis } from './infrastructure/redis/redis.client.js';
+import { connectProducer } from './infrastructure/kafka/producer.js';
+import { verifyKafkaConnectivity } from './infrastructure/kafka/admin.js';
 import { closeInfrastructureConnections } from './infrastructure/shutdown.js';
-
-let isRunning = true;
+import { startReservationWorker, stopReservationWorker } from './workers/reservation.worker.js';
+import { startOutboxWorker, stopOutboxWorker } from './workers/outbox.worker.js';
+import { startOrderSaga, stopOrderSaga } from './modules/sagas/orderSaga.orchestrator.js';
 
 /**
- * Gracefully shuts down active background workers and DB connections.
+ * Gracefully shuts down active background workers and network connections.
  */
 async function gracefulWorkerShutdown(signal) {
   logger.info({ signal }, 'Worker process graceful shutdown initiated...');
-  isRunning = false;
+  stopOutboxWorker();
+  stopReservationWorker();
+  await stopOrderSaga();
+
   try {
     await closeInfrastructureConnections();
     logger.info('Worker connections terminated. Exiting process.');
@@ -29,14 +36,22 @@ function registerWorkerHandlers() {
 }
 
 /**
- * Boots background workers (Outbox, Reservation, Notification, Kafka Consumers).
+ * Boots background workers (Outbox, Reservation, Saga Orchestrator).
  */
 async function startWorkers() {
   registerWorkerHandlers();
   try {
     logger.info('Initializing OmniRetail Background Worker Runtime...');
     await connectDatabase();
-    logger.info('Background Worker Runtime active and ready for jobs');
+    await connectRedis();
+    await verifyKafkaConnectivity();
+    await connectProducer();
+
+    startReservationWorker();
+    startOutboxWorker();
+    await startOrderSaga();
+
+    logger.info('🚀 OmniRetail Background Workers & Saga Orchestrator active');
   } catch (err) {
     logger.fatal({ err }, 'Worker initialization failed');
     process.exit(1);
