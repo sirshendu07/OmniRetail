@@ -40,6 +40,7 @@ export async function authenticate(req, _res, next) {
 
     req.user = {
       id: payload.userId,
+      _id: payload.userId,
       role: payload.role
     };
     req.sessionId = payload.sessionId;
