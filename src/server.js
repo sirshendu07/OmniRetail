@@ -4,6 +4,8 @@ import { logger } from './common/utils/logger.js';
 import { connectDatabase } from './database/connection.js';
 import { connectRedis } from './infrastructure/redis/redis.client.js';
 import { connectProducer } from './infrastructure/kafka/producer.js';
+import { verifyKafkaConnectivity, ensureTopicsExist } from './infrastructure/kafka/admin.js';
+import { KAFKA_TOPICS } from './infrastructure/kafka/topics.js';
 import { closeInfrastructureConnections } from './infrastructure/shutdown.js';
 
 let server = null;
@@ -54,13 +56,10 @@ function registerProcessHandlers() {
 async function startServer() {
   registerProcessHandlers();
   try {
-    logger.info('Connecting to MongoDB Atlas...');
     await connectDatabase();
-
-    logger.info('Connecting to Redis cluster...');
     await connectRedis();
-
-    logger.info('Connecting to Kafka broker...');
+    await verifyKafkaConnectivity();
+    await ensureTopicsExist(Object.values(KAFKA_TOPICS));
     await connectProducer();
 
     server = app.listen(env.PORT, () => {
